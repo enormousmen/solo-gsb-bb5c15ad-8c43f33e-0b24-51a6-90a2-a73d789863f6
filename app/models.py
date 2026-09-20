@@ -149,6 +149,27 @@ class HealthOut(BaseModel):
 # 切割执行会话
 # ---------------------------------------------------------------------------
 
+class StartSessionRequest(BaseModel):
+    """启动切割会话的可选参数：刀具寿命检查点（按累计切长计，单位 mm）。"""
+    model_config = ConfigDict(extra="forbid")
+
+    blade_life: Optional[float] = Field(
+        None, gt=0, le=1_000_000_000,
+        description="刀具寿命：累计切长上限（mm，与排样单位一致）；不传则不跟踪")
+    initial_used: float = Field(
+        0.0, ge=0, le=1_000_000_000,
+        description="启动时当前刀具已用切长（mm），默认 0")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.blade_life is None and self.initial_used != 0:
+            raise ValueError("未设置 blade_life 时 initial_used 必须为 0")
+        if (self.blade_life is not None
+                and self.initial_used > self.blade_life):
+            raise ValueError("initial_used 不能超过 blade_life")
+        return self
+
+
 class CutEventRequest(BaseModel):
     """“完成当前刀”事件：版本与当前刀由服务端在事务中一并校验。"""
     model_config = ConfigDict(extra="forbid")
@@ -184,6 +205,17 @@ class CutBatchRequest(BaseModel):
         ..., description="按执行顺序排列的切刀列表（可为空，表示仅对账不推进）")
 
 
+class BladeChangeRequest(BaseModel):
+    """换刀确认：版本与幂等键由服务端在事务中一并校验。"""
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(
+        ..., ge=0, description="客户端看到的会话版本（乐观锁）")
+    idempotency_key: str = Field(
+        ..., min_length=1, max_length=128,
+        description="幂等键（会话内唯一）：同键重试返回首次结果")
+
+
 class SessionCutOut(BaseModel):
     """会话视角的一刀（在方案 CutOut 之上附带母板编号）。"""
     panel_no: int
@@ -200,13 +232,22 @@ class SessionResponse(BaseModel):
     plan_id: str
     status: Literal["active", "completed"]
     completed: bool = Field(..., description="全部切割是否已完成")
-    version: int = Field(..., description="当前版本号，每完成一刀 +1")
+    version: int = Field(..., description="当前版本号，每完成一刀或换刀一次 +1")
     completed_cuts: int = Field(..., description="已完成刀数")
     total_cuts: int = Field(..., description="总刀数（启动会话时快照）")
     current_panel: Optional[int] = Field(
         ..., description="当前母板编号（下一刀所在板）；已完成为 null")
     next_cut: Optional[SessionCutOut] = Field(
         ..., description="下一刀；已完成为 null")
+    blade_life: Optional[float] = Field(
+        ..., description="刀具寿命：累计切长上限（mm）；未跟踪为 null")
+    blade_used: Optional[float] = Field(
+        ..., description="当前刀具已用累计切长（mm）；未跟踪为 null")
+    blade_remaining: Optional[float] = Field(
+        ..., description="当前刀具剩余可用切长（mm）；未跟踪为 null")
+    next_action: Literal["cut", "blade_change", "none"] = Field(
+        ..., description="下一步动作：cut=继续切；blade_change=下一刀会超过"
+                         "刀具寿命，须先换刀；none=会话已完成")
     created_at: str
     updated_at: str
     completed_at: Optional[str]

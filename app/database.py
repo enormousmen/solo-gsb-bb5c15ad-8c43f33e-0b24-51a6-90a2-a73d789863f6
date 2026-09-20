@@ -3,15 +3,23 @@
 plan_id 由规范化请求 JSON 的 SHA256 派生（与时间无关），相同输入天然幂等：
 重复提交会命中已存在的方案记录并原样返回，保证“相同输入得到稳定结果”。
 
-切割执行会话（cut_sessions / cut_session_events / cut_session_batches）：
-- cut_sessions 记录一次方案执行的进度：version 为乐观锁版本，每完成一刀 +1；
+切割执行会话（cut_sessions / cut_session_events / cut_session_batches /
+cut_session_blade_changes）：
+- cut_sessions 记录一次方案执行的进度：version 为乐观锁版本，每完成一刀或
+  每确认一次换刀 +1；blade_life/blade_used 为刀具寿命检查点状态（按累计切长
+  计，单位 mm 与排样一致；blade_life 为 NULL 表示不跟踪）；
 - cut_session_events 以 (session_id, idempotency_key) 为主键记录已应用事件，
   同一键重试直接重放首次响应，同键不同请求视为冲突；
 - cut_session_batches 以 (session_id, batch_id) 为主键记录已应用批次，
   供设备离线后批量回传：对账一致的前缀仅跳过，其余后缀连续匹配当前方案后
   一次性推进；同键重试重放首次响应，同键不同请求视为冲突；
-- 事件/批次推进走 transaction()（BEGIN IMMEDIATE）：校验与状态推进在同一
-  事务中原子完成，并发写者由 SQLite 写锁串行化，旧版本/跳步请求不会推进状态。
+- cut_session_blade_changes 以 (session_id, idempotency_key) 为主键记录已
+  确认的换刀：同事务把 blade_used 归零并把 version +1；由于
+  version = completed_cuts + 换刀次数 是不变量，批次对账用换刀记录把
+  base_version 换算回“该版本对应的已完成刀数”；
+- 事件/批次/换刀推进走 transaction()（BEGIN IMMEDIATE）：校验与状态推进在
+  同一事务中原子完成，并发写者由 SQLite 写锁串行化，旧版本/跳步请求不会
+  推进状态；并发换刀与切刀因版本校验只有一方能成功。
 """
 from __future__ import annotations
 
@@ -47,9 +55,11 @@ CREATE TABLE IF NOT EXISTS cut_sessions (
     session_id     TEXT PRIMARY KEY,
     plan_id        TEXT NOT NULL REFERENCES plans(plan_id),
     status         TEXT NOT NULL,              -- active / completed
-    version        INTEGER NOT NULL,           -- 乐观锁版本：每完成一刀 +1
+    version        INTEGER NOT NULL,           -- 乐观锁版本：每完成一刀或换刀一次 +1
     completed_cuts INTEGER NOT NULL,           -- 已完成刀数
     total_cuts     INTEGER NOT NULL,           -- 启动时快照的总刀数
+    blade_life     REAL,                       -- 刀具寿命（累计切长上限 mm）；NULL=不跟踪
+    blade_used     REAL NOT NULL DEFAULT 0,    -- 当前刀具已用累计切长 mm
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     completed_at   TEXT                        -- 全部完成的时间；未完成为 NULL
@@ -81,17 +91,45 @@ CREATE TABLE IF NOT EXISTS cut_session_batches (
     created_at   TEXT NOT NULL,
     PRIMARY KEY (session_id, batch_id)
 );
+
+-- 换刀确认幂等记录：同一 (session_id, idempotency_key) 只应用一次
+CREATE TABLE IF NOT EXISTS cut_session_blade_changes (
+    session_id      TEXT NOT NULL REFERENCES cut_sessions(session_id),
+    idempotency_key TEXT NOT NULL,
+    version         INTEGER NOT NULL,        -- 本次换刀后达到的会话版本
+    request_json    TEXT NOT NULL,           -- 规范化请求（识别同键不同请求）
+    response_json   TEXT NOT NULL,           -- 首次应用的响应，重试原样返回
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (session_id, idempotency_key)
+);
 """
 
 
 def init_db(path: Optional[str] = None) -> None:
-    """创建数据目录、连接并初始化表结构；可重复执行。"""
+    """创建数据目录、连接并初始化表结构；可重复执行。
+
+    对已存在的旧库做就地迁移：为 cut_sessions 补上刀具寿命列（新表由
+    _SCHEMA 的 CREATE TABLE IF NOT EXISTS 自动建立）。
+    """
     target = path or DB_PATH
     os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
     with sqlite3.connect(target) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.executescript(_SCHEMA)
+        _migrate(conn)
         conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库就地迁移（幂等）：cut_sessions 增加 blade_life / blade_used。"""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(cut_sessions)")}
+    if "blade_life" not in cols:
+        conn.execute("ALTER TABLE cut_sessions ADD COLUMN blade_life REAL")
+    if "blade_used" not in cols:
+        conn.execute(
+            "ALTER TABLE cut_sessions "
+            "ADD COLUMN blade_used REAL NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -194,18 +232,20 @@ def count_plans(conn: sqlite3.Connection) -> int:
 # ---------------------------------------------------------------------------
 
 def insert_session(session_id: str, plan_id: str, status: str, version: int,
-                   completed_cuts: int, total_cuts: int, created_at: str,
-                   updated_at: str, completed_at: Optional[str],
+                   completed_cuts: int, total_cuts: int,
+                   blade_life: Optional[float], blade_used: float,
+                   created_at: str, updated_at: str,
+                   completed_at: Optional[str],
                    conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT INTO cut_sessions
           (session_id, plan_id, status, version, completed_cuts, total_cuts,
-           created_at, updated_at, completed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           blade_life, blade_used, created_at, updated_at, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (session_id, plan_id, status, version, completed_cuts, total_cuts,
-         created_at, updated_at, completed_at),
+         blade_life, blade_used, created_at, updated_at, completed_at),
     )
 
 
@@ -214,7 +254,7 @@ def get_session(session_id: str, conn: sqlite3.Connection) -> Optional[dict]:
     row = conn.execute(
         """
         SELECT s.session_id, s.plan_id, s.status, s.version,
-               s.completed_cuts, s.total_cuts,
+               s.completed_cuts, s.total_cuts, s.blade_life, s.blade_used,
                s.created_at, s.updated_at, s.completed_at,
                p.response_json AS plan_json
           FROM cut_sessions s
@@ -227,18 +267,31 @@ def get_session(session_id: str, conn: sqlite3.Connection) -> Optional[dict]:
 
 
 def update_session_progress(session_id: str, version: int, completed_cuts: int,
-                            status: str, updated_at: str,
+                            status: str, blade_used: float, updated_at: str,
                             completed_at: Optional[str],
                             conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         UPDATE cut_sessions
-           SET version = ?, completed_cuts = ?, status = ?,
+           SET version = ?, completed_cuts = ?, status = ?, blade_used = ?,
                updated_at = ?, completed_at = ?
          WHERE session_id = ?
         """,
-        (version, completed_cuts, status, updated_at, completed_at,
+        (version, completed_cuts, status, blade_used, updated_at, completed_at,
          session_id),
+    )
+
+
+def reset_session_blade(session_id: str, version: int, updated_at: str,
+                        conn: sqlite3.Connection) -> None:
+    """换刀确认：已用切长归零并递增版本（不改动进度/状态）。"""
+    conn.execute(
+        """
+        UPDATE cut_sessions
+           SET version = ?, blade_used = 0, updated_at = ?
+         WHERE session_id = ?
+        """,
+        (version, updated_at, session_id),
     )
 
 
@@ -312,4 +365,51 @@ def count_session_batches(session_id: str, conn: sqlite3.Connection) -> int:
     return conn.execute(
         "SELECT COUNT(*) AS c FROM cut_session_batches WHERE session_id = ?",
         (session_id,),
+    ).fetchone()["c"]
+
+
+def insert_blade_change(session_id: str, idempotency_key: str, version: int,
+                        request_json: str, response_json: str, created_at: str,
+                        conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT INTO cut_session_blade_changes
+          (session_id, idempotency_key, version,
+           request_json, response_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, idempotency_key, version,
+         request_json, response_json, created_at),
+    )
+
+
+def get_blade_change(session_id: str, idempotency_key: str,
+                     conn: sqlite3.Connection) -> Optional[dict]:
+    row = conn.execute(
+        """
+        SELECT session_id, idempotency_key, version,
+               request_json, response_json, created_at
+          FROM cut_session_blade_changes
+         WHERE session_id = ? AND idempotency_key = ?
+        """,
+        (session_id, idempotency_key),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def count_blade_changes_up_to(session_id: str, version: int,
+                              conn: sqlite3.Connection) -> int:
+    """截至某会话版本（含）已确认的换刀次数。
+
+    不变量 version = completed_cuts + 换刀次数：每刀推进 version 与
+    completed_cuts 各 +1，每次换刀仅 version +1。因此任意历史版本 V 对应的
+    已完成刀数 = V - 本函数返回值，批次对账用它把 base_version 换算成刀数。
+    """
+    return conn.execute(
+        """
+        SELECT COUNT(*) AS c
+          FROM cut_session_blade_changes
+         WHERE session_id = ? AND version <= ?
+        """,
+        (session_id, version),
     ).fetchone()["c"]

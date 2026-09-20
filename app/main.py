@@ -7,20 +7,26 @@
   GET  /api/v1/plans                          查询方案列表（分页）
   POST /api/v1/plans/{plan_id}/gcode          导出方案的 G-code
   POST /api/v1/plans/{plan_id}/sessions       从方案启动切割执行会话
+                                              （可选 blade_life/initial_used
+                                              开启刀具寿命检查点）
   GET  /api/v1/sessions/{session_id}          查询切割会话状态
   POST /api/v1/sessions/{session_id}/events   提交“完成当前刀”事件（幂等）
   POST /api/v1/sessions/{session_id}/event-batches
                                               离线回传切刀批次（对账 + 幂等）
+  POST /api/v1/sessions/{session_id}/blade-changes
+                                              确认换刀（已用切长归零 + 版本递增）
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import database as db
 from .models import (
+    BladeChangeRequest,
     CutBatchRequest,
     CutBatchResponse,
     CutEventRequest,
@@ -32,10 +38,12 @@ from .models import (
     PlanResponse,
     PlanSummary,
     SessionResponse,
+    StartSessionRequest,
 )
 from .services import (
     PlanGeometryError,
     SessionConflictError,
+    change_blade,
     create_plan,
     export_gcode,
     get_session_state,
@@ -63,8 +71,11 @@ app = FastAPI(
         "并发与重试不会破坏执行状态。设备离线期间完成的切刀可按批次回传："
         "服务端在单事务中将 base_version 之后已完成区间与批次前缀逐项对账，"
         "一致前缀仅跳过，其余后缀连续匹配当前方案后一次性推进。"
+        "可选的刀具寿命检查点按累计切长（mm）预判：下一刀会超过寿命则"
+        "拒绝推进并提示换刀；换刀确认在同事务中把已用切长归零并递增版本，"
+        "并发换刀与切刀只有一方成功。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -147,10 +158,15 @@ def list_plans(
     response_model=SessionResponse,
     status_code=201,
     tags=["sessions"],
-    summary="从已保存方案启动切割执行会话",
+    summary="从已保存方案启动切割执行会话（可选刀具寿命检查点）",
 )
-def post_plan_session(plan_id: str) -> SessionResponse:
-    payload = start_session(plan_id)
+def post_plan_session(plan_id: str,
+                      req: Optional[StartSessionRequest] = None
+                      ) -> SessionResponse:
+    blade_life = req.blade_life if req is not None else None
+    initial_used = req.initial_used if req is not None else 0.0
+    payload = start_session(plan_id, blade_life=blade_life,
+                            initial_used=initial_used)
     if payload is None:
         raise HTTPException(status_code=404, detail="方案不存在")
     return JSONResponse(payload, status_code=201)
@@ -197,7 +213,25 @@ def post_session_event_batch(session_id: str,
     try:
         payload = submit_cut_batch(session_id, req)
     except SessionConflictError as exc:
-        # 幂等键冲突/基线版本越界/对账或后缀不匹配：整批未推进
+        # 幂等键冲突/基线版本越界/对账或后缀不匹配/越过寿命检查点：整批未推进
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return JSONResponse(payload)
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/blade-changes",
+    response_model=SessionResponse,
+    tags=["sessions"],
+    summary="确认换刀（版本 + 幂等键，事务中将已用切长归零并递增版本）",
+)
+def post_session_blade_change(session_id: str,
+                              req: BladeChangeRequest) -> SessionResponse:
+    try:
+        payload = change_blade(session_id, req)
+    except SessionConflictError as exc:
+        # 版本/幂等键冲突、会话已完成或未跟踪刀具寿命：未确认换刀
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     if payload is None:
         raise HTTPException(status_code=404, detail="会话不存在")

@@ -12,7 +12,10 @@
   排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝；
   切割执行会话持久化，逐刀事件以乐观锁版本 + 幂等键在 SQLite 事务中校验，
   并发与重试不会破坏执行状态；设备离线期间完成的切刀可按批次回传，
-  服务端在单事务中对账（一致前缀仅跳过、其余连续匹配后一次性推进）。
+  服务端在单事务中对账（一致前缀仅跳过、其余连续匹配后一次性推进）；
+  可选的刀具寿命检查点按累计切长（mm）预判，下一刀会超过寿命即拒绝推进
+  并提示换刀，换刀确认在同事务中把已用切长归零并递增版本，
+  并发换刀与切刀只有一方成功。
 
 ---
 
@@ -283,6 +286,20 @@ M2
 **无切割线的方案**（零件恰好铺满母板、或全部零件未排入）启动即完成：
 `status="completed"`、`completed=true`、`completed_at` 即刻写入。
 
+请求体**可选**（不传或传 `{}` 均可）：设置 `blade_life` 即开启按累计切长
+计算的刀具寿命检查点（单位 mm，与排样一致）。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `blade_life` | number, >0，可选 | 刀具寿命：累计切长上限（mm）；不传则不跟踪 |
+| `initial_used` | number, ≥0，默认 0 | 启动时当前刀具已用切长（mm）；须 ≤ `blade_life`，且未设置 `blade_life` 时必须为 0 |
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/plans/a6df…/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"blade_life": 5000, "initial_used": 0}'
+```
+
 响应（`201`，与查询/事件接口同构的 `SessionResponse`）：
 
 ```jsonc
@@ -291,7 +308,7 @@ M2
   "plan_id": "a6df…",
   "status": "active",            // active / completed
   "completed": false,            // 全部刀是否已完成
-  "version": 0,                  // 乐观锁版本，每完成一刀 +1
+  "version": 0,                  // 乐观锁版本，每完成一刀或换刀一次 +1
   "completed_cuts": 0,           // 已完成刀数
   "total_cuts": 20,              // 总刀数（启动时快照）
   "current_panel": 1,            // 当前母板（下一刀所在板）；已完成为 null
@@ -300,6 +317,10 @@ M2
     "x": 120.0, "y": 0.0, "length": 122.0,
     "region": {"x": 0.0, "y": 0.0, "width": 244.0, "height": 122.0}
   },
+  "blade_life": 5000.0,          // 刀具寿命（mm）；未跟踪为 null
+  "blade_used": 0.0,             // 当前刀具已用累计切长（mm）；未跟踪为 null
+  "blade_remaining": 5000.0,     // 剩余可用切长（mm）；未跟踪为 null
+  "next_action": "cut",          // cut=继续切；blade_change=须先换刀；none=已完成
   "created_at": "2026-09-19T17:41:42Z",
   "updated_at": "2026-09-19T17:41:42Z",
   "completed_at": null
@@ -308,8 +329,10 @@ M2
 
 ### `GET /api/v1/sessions/{session_id}` — 查询切割会话
 
-返回当前母板、下一刀、已完成数与 `completed` 状态（结构同上）；
-不存在返回 `404`。
+返回当前母板、下一刀、已完成数与 `completed` 状态（结构同上），并持续给出
+`blade_used` / `blade_remaining` / `next_action`（单位 mm，与排样一致；
+未设置 `blade_life` 时刀具字段为 `null`，`next_action` 恒为 `"cut"`，
+已完成为 `"none"`）；不存在返回 `404`。
 
 ```bash
 curl -s http://localhost:8000/api/v1/sessions/3f8c…
@@ -334,7 +357,8 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/events \
 
 服务端在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内依次执行：查幂等记录 →
 校验会话未完成 → 校验 `expected_version` 等于当前版本 → 校验所报
-`(panel_no, step)` 正是当前刀 → 推进版本与进度并记录事件，然后一次性提交。
+`(panel_no, step)` 正是当前刀 → 校验下一刀不越过刀具寿命检查点 →
+推进版本与进度（并累计 `blade_used`）并记录事件，然后一次性提交。
 由此保证：
 
 - **幂等重试**：同一 `idempotency_key` + 相同请求体重试，返回首次应用的
@@ -344,6 +368,10 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/events \
   `409 version_conflict`，状态不推进。`BEGIN IMMEDIATE` 使并发写者在库级
   串行，同版本并发请求只有一个能应用，其余读到推进后的版本并被拒绝；
 - **跳步/乱序**：所报刀不是当前刀 → `409 cut_mismatch`，状态不推进；
+- **刀具寿命检查点**：开启 `blade_life` 后，若下一刀会使累计切长超过寿命
+  （`blade_used + 下一刀 length > blade_life`）→ `409 blade_change_required`，
+  单刀事件不得越过检查点，状态不推进；此时 `next_action` 为
+  `"blade_change"`，须先调用换刀确认接口；
 - **已完成**：`409 session_completed`；会话不存在 `404`。
 
 成功返回推进后的会话状态（结构同 `SessionResponse`）。冲突响应示例：
@@ -360,7 +388,9 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/events \
 ```
 
 `detail.error` 取值：`version_conflict` / `cut_mismatch` /
-`session_completed` / `idempotency_key_reuse`。
+`session_completed` / `idempotency_key_reuse` / `blade_change_required`。
+`blade_change_required` 的 `detail` 附带 `blade_life`、`blade_used`、
+`blade_remaining`（mm）与越界刀的 `cut_length`。
 
 ### `POST /api/v1/sessions/{session_id}/event-batches` — 离线回传切刀批次
 
@@ -389,20 +419,28 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
 服务端在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内依次执行：查批次幂等
 记录 → 校验 `base_version` 不超过当前版本 → 把 `base_version` 之后服务端
 **已完成的区间与批次前缀逐项对账**（一致前缀仅跳过；首个不一致整批拒绝）
-→ 其余后缀必须**连续匹配当前方案**的下一刀序列 → 验证通过后一次性推进
-`version` 与 `completed_cuts` 并记录批次，然后一次性提交。由此保证：
+→ 其余后缀必须**连续匹配当前方案**的下一刀序列 → 校验待应用后缀不越过
+刀具寿命检查点 → 验证通过后一次性推进 `version` 与 `completed_cuts`
+（并累计 `blade_used`）并记录批次，然后一次性提交。由此保证：
 
 - **对账跳过**：离线期间服务端已通过单刀事件（或先前批次）推进的区间，
-  与批次前缀一致的部分只跳过不重复推进；
+  与批次前缀一致的部分只跳过不重复推进（跳过的刀不重复累计切长）；
 - **整批原子**：前缀对账或后缀匹配任一失败 → `409 batch_mismatch`，
   整批不推进（`detail` 含 `phase`=`reconcile`/`apply`、批次内下标 `index`
   及 `expected`/`received`）；`base_version` 比服务端还新 →
   `409 version_conflict`；
+- **寿命检查点**：开启 `blade_life` 后，待应用后缀中**任一刀**会使累计切长
+  越过寿命 → `409 blade_change_required`（`detail` 含批次内下标 `index`），
+  **整批不推进**；须先换刀再以对齐新版本的 `base_version` 重发；
 - **幂等重放**：同一 `batch_id` + 相同请求体重试，返回首次应用的原始响应
   （HTTP `200`，逐字段一致），状态不重复推进；同键不同请求 →
   `409 batch_id_reuse`；
-- **并发安全**：批次与单刀、批次与批次在库级串行，后到者基于最新状态重新
-  对账——已被覆盖的批次自然转为“全部跳过”，不会重复推进。
+- **并发安全**：批次与单刀、批次与批次、批次与换刀在库级串行，后到者基于
+  最新状态重新对账——已被覆盖的批次自然转为“全部跳过”，不会重复推进。
+
+> **版本换算**：`version` 随切刀与换刀共同递增（`version = completed_cuts
+> + 换刀次数`）。服务端依据换刀记录把 `base_version` 换算成该版本对应的
+> 已完成刀数再对账，因此离线期间发生的换刀不会扰乱批次对账。
 
 成功返回 `skipped`/`applied` 数量及最新会话状态：
 
@@ -418,6 +456,10 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
     "total_cuts": 20,
     "current_panel": 1,
     "next_cut": {"panel_no": 1, "step": 6, "axis": "H", "…": "…"},
+    "blade_life": 5000.0,
+    "blade_used": 610.0,
+    "blade_remaining": 4390.0,
+    "next_action": "cut",
     "created_at": "2026-09-20T08:00:00Z",
     "updated_at": "2026-09-20T09:30:00Z",
     "completed_at": null
@@ -426,7 +468,36 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
 ```
 
 `detail.error` 取值：`batch_mismatch` / `version_conflict` /
-`batch_id_reuse`；会话不存在返回 `404`。
+`batch_id_reuse` / `blade_change_required`；会话不存在返回 `404`。
+
+### `POST /api/v1/sessions/{session_id}/blade-changes` — 确认换刀
+
+刀具到达寿命检查点（`next_action="blade_change"`）后，操作员换刀并调用本
+接口确认：在**单个 SQLite 写事务**中把 `blade_used` 归零并把 `version` +1。
+刀具未用完时也允许预防性换刀。请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `expected_version` | int, ≥0 | 客户端看到的会话版本（乐观锁） |
+| `idempotency_key` | string, 1~128 字符 | 幂等键（会话内唯一） |
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/blade-changes \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 5, "idempotency_key": "blade-change-001"}'
+```
+
+成功返回换刀后的会话状态（`SessionResponse`：`blade_used=0`、
+`blade_remaining=blade_life`、`next_action` 回到 `"cut"`，`version` 已 +1，
+后续切刀事件/批次须使用新版本）。保证：
+
+- **幂等重试**：同一 `idempotency_key` + 相同请求体重试，返回首次应用的
+  原始响应（HTTP `200`，逐字段一致），不重复归零/递增；
+- **同键不同请求**：`409 idempotency_key_reuse`；
+- **并发互斥**：换刀与切刀事件/批次共用同一版本序列与写事务——并发换刀与
+  切刀只有一个能通过版本校验，另一方 `409 version_conflict`；
+- **未跟踪寿命**：会话启动时未设置 `blade_life` → `409 blade_not_tracked`；
+- **已完成**：`409 session_completed`；会话不存在 `404`。
 
 ### `GET /health`
 
@@ -471,14 +542,14 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（方案/会话/事件/G-code/健康检查）+ 启动建库
+│   ├── main.py          # FastAPI 路由（方案/会话/事件/批次/换刀/G-code/健康检查）+ 启动建库
 │   ├── models.py        # 请求/响应 Pydantic 模型与参数校验
 │   ├── nesting.py       # 直切排样核心算法 + 几何自检 + 响应装配
 │   ├── gcode.py         # G-code 导出：坐标变换、导出前校验、确定性文本生成
-│   ├── services.py      # 业务编排、幂等落库、切割会话推进（事件/批次事务校验）
-│   ├── database.py      # SQLite 连接、建表、plan_id 摘要、方案/会话 CRUD、写事务
+│   ├── services.py      # 业务编排、幂等落库、切割会话推进（事件/批次/换刀事务校验）
+│   ├── database.py      # SQLite 连接、建表与迁移、plan_id 摘要、方案/会话 CRUD、写事务
 │   └── init_db.py       # python -m app.init_db 建库入口
-├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/会话与批次并发/API 端到端
+├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/会话与批次并发/刀具寿命/API 端到端
 ├── entrypoint.sh        # 容器启动：建库 + uvicorn（一条命令）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -499,4 +570,7 @@ python3 -m unittest discover -s tests -v
 返回、同键冲突、旧版本与跳步拒绝、多线程并发竞争（同版本唯一胜者、同键全员
 重放、带重试跑完整个会话）**、**离线批次的对账跳过/整批原子拒绝/空批次同步/
 完成后重传、批次幂等重放与同键冲突、重叠批次并发合成、批次与单刀混合并发
-跑完整个会话**，以及基于 TestClient 的 HTTP 端到端。
+跑完整个会话**、**刀具寿命检查点的启动参数校验/逐刀预判拦截/initial_used 计入/
+换刀归零与版本递增/批次整批拦截与越界下标/跨换刀的 base_version 换算/
+跳过前缀不重复计长/换刀与切刀并发互斥/切刀+换刀混合并发跑完整个会话**，
+以及基于 TestClient 的 HTTP 端到端。
