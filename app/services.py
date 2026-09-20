@@ -1,9 +1,9 @@
 """排样业务编排：参数模型 -> 核心算法 -> 响应装配 -> 落库。
 
 切割执行会话：从已保存方案启动会话，按 (panel_no, step) 顺序逐刀推进；
-“完成当前刀”事件与离线回传批次在单个 SQLite 写事务中完成幂等判定、
-版本与对账校验、状态推进和事件/批次记录，并发/重试语义见
-submit_cut_event 与 submit_cut_batch。
+“完成当前刀”事件、换刀确认与离线回传批次在单个 SQLite 写事务中完成幂等
+判定、版本/对账/刀具寿命校验、状态推进和事件/批次/换刀记录，并发/重试语义
+见 submit_cut_event、confirm_blade_change 与 submit_cut_batch。
 """
 from __future__ import annotations
 
@@ -15,13 +15,22 @@ from typing import Optional
 from . import database as db
 from .gcode import generate_gcode, validate_plan_cuts
 from .models import (
+    BLADE_EPS,
     BatchCutIn,
     CutBatchRequest,
     CutEventRequest,
     GcodeRequest,
     PlanRequest,
+    StartSessionRequest,
 )
 from .nesting import build_payload, solve
+
+# 累计切长保留的小数位（mm）：与排样输出精度对齐，避免浮点尾差影响寿命判定
+_BLADE_NDIGITS = 6
+
+
+def _round6(x: float) -> float:
+    return round(float(x), _BLADE_NDIGITS)
 
 
 def _now_iso() -> str:
@@ -124,6 +133,33 @@ def flatten_cuts(plan: dict) -> list[dict]:
     return seq
 
 
+def _blade_view(row: dict, cuts: list[dict], done: int) -> dict:
+    """计算刀具寿命视图：blade_used/blade_remaining/next_action。
+
+    next_action：已完成 -> done；启用寿命且下一刀会使累计切长越过寿命 ->
+    blade_change（恰好等于寿命视为不越过）；否则 cut。
+    """
+    life = row["blade_life"]
+    used = _round6(row["blade_used"])
+    if life is None:
+        next_action = "done" if done >= len(cuts) else "cut"
+        return {"blade_life": None, "blade_used": used,
+                "blade_remaining": None, "next_action": next_action}
+    life = float(life)
+    if done >= len(cuts):
+        next_action = "done"
+    elif used + float(cuts[done]["length"]) > life + BLADE_EPS:
+        next_action = "blade_change"
+    else:
+        next_action = "cut"
+    return {
+        "blade_life": life,
+        "blade_used": used,
+        "blade_remaining": _round6(life - used),
+        "next_action": next_action,
+    }
+
+
 def _session_state(row: dict, plan: Optional[dict] = None) -> dict:
     """由会话行（+ 方案）装配对外会话状态。"""
     if plan is None:
@@ -141,17 +177,28 @@ def _session_state(row: dict, plan: Optional[dict] = None) -> dict:
         "total_cuts": row["total_cuts"],
         "current_panel": nxt["panel_no"] if nxt else None,
         "next_cut": nxt,
+        **_blade_view(row, cuts, done),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "completed_at": row["completed_at"],
     }
 
 
-def start_session(plan_id: str) -> Optional[dict]:
+def start_session(plan_id: str,
+                  blade: Optional[StartSessionRequest] = None) -> Optional[dict]:
     """从已保存方案启动切割会话；方案不存在返回 None。
 
-    无切割线的方案（零件恰好铺满无余料切刀，或全部未排）启动即完成。
+    blade 可携带 blade_life（刀具寿命，mm）与 initial_used（启动时已用切长）；
+    请求体整体省略时不做刀具寿命检查。无切割线的方案（零件恰好铺满无余料
+    切刀，或全部未排）启动即完成。
     """
+    blade_life = None
+    initial_used = 0.0
+    if blade is not None:
+        blade_life = blade.blade_life
+        initial_used = _round6(blade.initial_used)
+        if blade_life is not None:
+            blade_life = float(blade_life)
     with db.get_conn() as conn:
         plan = db.get_plan(plan_id, conn)
         if plan is None:
@@ -171,6 +218,8 @@ def start_session(plan_id: str) -> Optional[dict]:
             updated_at=now,
             completed_at=now if done else None,
             conn=conn,
+            blade_life=blade_life,
+            blade_used=initial_used,
         )
         conn.commit()
         row = db.get_session(session_id, conn)
@@ -225,7 +274,7 @@ def submit_cut_event(session_id: str, req: CutEventRequest) -> Optional[dict]:
                 })
             return json.loads(evt["response_json"])
 
-        # 2) 校验：会话未完成 -> 版本一致 -> 所报刀正是当前刀
+        # 2) 校验：会话未完成 -> 版本一致 -> 所报刀正是当前刀 -> 未越过寿命检查点
         if row["status"] == "completed":
             raise SessionConflictError({
                 "error": "session_completed",
@@ -253,20 +302,51 @@ def submit_cut_event(session_id: str, req: CutEventRequest) -> Optional[dict]:
                 "expected": {"panel_no": nxt["panel_no"], "step": nxt["step"]},
                 "received": {"panel_no": req.panel_no, "step": req.step},
             })
+        life = row["blade_life"]
+        used = float(row["blade_used"])
+        new_used = used + float(nxt["length"])
+        if life is not None and new_used > float(life) + BLADE_EPS:
+            # 寿命检查点：本刀不得越过，先调换刀确认
+            raise SessionConflictError({
+                "error": "blade_life_exceeded",
+                "message": f"下一刀（第 {nxt['panel_no']} 板第 {nxt['step']} 刀，"
+                           f"切长 {nxt['length']}）会使累计切长 {_round6(new_used)} "
+                           f"超过刀片寿命 {float(life)}，请先确认换刀",
+                "blade_life": float(life),
+                "blade_used": _round6(used),
+                "blade_remaining": _round6(float(life) - used),
+                "next_cut": {"panel_no": nxt["panel_no"],
+                             "step": nxt["step"],
+                             "length": nxt["length"]},
+                "next_action": "blade_change",
+            })
 
-        # 3) 推进 + 记录事件，同事务提交
+        # 3) 推进 + 记录事件，同事务提交；乐观条件更新兜住读-写之间的并发
         now = _now_iso()
         new_done = row["completed_cuts"] + 1
         finished = new_done >= row["total_cuts"]
-        db.update_session_progress(
+        new_version = row["version"] + 1
+        new_used = _round6(new_used) if life is not None else None
+        updated = db.update_session_progress(
             session_id=session_id,
-            version=row["version"] + 1,
+            expected_version=row["version"],
+            version=new_version,
             completed_cuts=new_done,
             status="completed" if finished else "active",
             updated_at=now,
             completed_at=now if finished else None,
             conn=conn,
+            blade_used=new_used,
         )
+        if updated == 0:
+            # 并发换刀/事件/批次抢先提交：回滚后以版本冲突拒绝
+            raise SessionConflictError({
+                "error": "version_conflict",
+                "message": f"expected_version={req.expected_version} 与当前版本 "
+                           "不一致（并发写者抢先推进），状态未推进",
+                "expected_version": req.expected_version,
+                "current_version": row["version"],
+            })
         state = _session_state(db.get_session(session_id, conn), plan)
         db.insert_session_event(
             session_id=session_id,
@@ -277,7 +357,89 @@ def submit_cut_event(session_id: str, req: CutEventRequest) -> Optional[dict]:
             response_json=json.dumps(state, ensure_ascii=False),
             created_at=now,
             conn=conn,
+            event_version=new_version,
         )
+        db.insert_session_op(session_id, new_version, "event", conn,
+                             panel_no=req.panel_no, step=req.step)
+        return state
+
+
+def confirm_blade_change(session_id: str, req) -> Optional[dict]:
+    """确认“已换刀”；会话不存在返回 None。
+
+    在单个 SQLite 写事务（BEGIN IMMEDIATE）中依次：
+      1. 幂等判定：同 (session_id, idempotency_key) 已应用且请求体一致 ->
+         原样返回首次响应；同键不同请求 -> 409；
+      2. 校验会话未完成、expected_version 等于当前版本（会话必须启用了
+         blade_life；寿命未启用时换刀无意义 -> 409 blade_life_not_enabled）；
+      3. 把已用切长归零、version +1（completed_cuts 不变），记录换刀确认，
+         一次性提交。
+
+    与切刀事件共用同一写事务与版本号空间：并发换刀与切刀在库级串行，
+    后到者读到推进后的版本并以 version_conflict 拒绝——只有一方成功。
+    """
+    request_json = db.canonical_request(req.model_dump())
+    with db.transaction() as conn:
+        row = db.get_session(session_id, conn)
+        if row is None:
+            return None
+
+        # 1) 幂等：同键重试返回首次结果（必须先于版本校验）
+        change = db.get_blade_change(session_id, req.idempotency_key, conn)
+        if change is not None:
+            if change["request_json"] != request_json:
+                raise SessionConflictError({
+                    "error": "idempotency_key_reuse",
+                    "message": "幂等键已被本会话中的不同请求使用",
+                })
+            return json.loads(change["response_json"])
+
+        # 2) 校验
+        if row["blade_life"] is None:
+            raise SessionConflictError({
+                "error": "blade_life_not_enabled",
+                "message": "本会话启动时未设置 blade_life，无需换刀确认",
+            })
+        if row["status"] == "completed":
+            raise SessionConflictError({
+                "error": "session_completed",
+                "message": f"会话已完成（共 {row['total_cuts']} 刀），"
+                           "不能再确认换刀",
+                "total_cuts": row["total_cuts"],
+            })
+        if req.expected_version != row["version"]:
+            raise SessionConflictError({
+                "error": "version_conflict",
+                "message": f"expected_version={req.expected_version} 与当前版本 "
+                           f"{row['version']} 不一致，换刀未确认",
+                "expected_version": req.expected_version,
+                "current_version": row["version"],
+            })
+
+        # 3) 已用切长归零、版本 +1，同事务提交；乐观条件更新兜住并发切刀
+        now = _now_iso()
+        new_version = row["version"] + 1
+        updated = db.reset_blade_used(session_id, row["version"], new_version,
+                                      now, conn)
+        if updated == 0:
+            raise SessionConflictError({
+                "error": "version_conflict",
+                "message": f"expected_version={req.expected_version} 与当前版本 "
+                           "不一致（并发切刀/换刀抢先推进），换刀未确认",
+                "expected_version": req.expected_version,
+                "current_version": row["version"],
+            })
+        state = _session_state(db.get_session(session_id, conn))
+        db.insert_blade_change(
+            session_id=session_id,
+            idempotency_key=req.idempotency_key,
+            from_version=row["version"],
+            request_json=request_json,
+            response_json=json.dumps(state, ensure_ascii=False),
+            created_at=now,
+            conn=conn,
+        )
+        db.insert_session_op(session_id, new_version, "blade", conn)
         return state
 
 
@@ -288,7 +450,8 @@ def _batch_mismatch_detail(phase: str, index: int,
     """组装批次校验失败的结构化错误体（整批不推进）。
 
     phase="reconcile"：批次前缀与 base_version 之后服务端已完成区间对账失败；
-    phase="apply"：其余后缀与当前方案的下一刀序列不匹配。
+    phase="apply"：其余后缀与当前方案的下一刀序列不匹配；
+    phase="blade_checkpoint"：后缀中某一刀会越过刀具寿命检查点。
     index 为批次 cuts 数组下标（从 0 开始）；expected/received 为 None 分别
     表示方案已无剩余切刀 / 批次未覆盖到该位置。
     """
@@ -320,6 +483,25 @@ def _batch_mismatch_detail(phase: str, index: int,
     }
 
 
+def _blade_checkpoint_detail(index: int, cut: dict, used: float,
+                             length: float, life: float) -> dict:
+    """组装批次越过刀具寿命检查点的结构化错误体（整批不推进）。"""
+    return {
+        "error": "blade_life_exceeded",
+        "message": f"批次 cuts[{index}]（第 {cut['panel_no']} 板第 "
+                   f"{cut['step']} 刀，切长 {length}）会使累计切长 "
+                   f"{_round6(used + length)} 超过刀片寿命 {float(life)}；"
+                   "请把该刀及其后切刀放到换刀确认之后的批次回传，整批未推进",
+        "phase": "blade_checkpoint",
+        "index": index,
+        "blade_life": float(life),
+        "blade_used_before_batch": _round6(used),
+        "cut": {"panel_no": cut["panel_no"], "step": cut["step"],
+                "length": length},
+        "next_action": "blade_change",
+    }
+
+
 def submit_cut_batch(session_id: str, req: CutBatchRequest) -> Optional[dict]:
     """提交设备离线期间完成的切刀批次；会话不存在返回 None。
 
@@ -331,12 +513,16 @@ def submit_cut_batch(session_id: str, req: CutBatchRequest) -> Optional[dict]:
       3. 对账：base_version 之后服务端已完成的区间与批次前缀逐项比对，
          一致前缀仅跳过；首个不一致 -> 409，整批不推进；
       4. 其余后缀必须连续匹配当前方案的下一刀序列，任一不符 -> 409；
-      5. 验证通过后一次性推进 version/completed_cuts（全部完成时置
-         completed），记录批次，一次性提交；applied=0 时不改动会话行。
+         启用刀具寿命时，后缀中任一刀会使累计切长越过寿命检查点 -> 409
+         （blade_life_exceeded，整批不推进，需先经换刀确认再回传后续批次）；
+      5. 验证通过后一次性推进 version/completed_cuts/blade_used（全部完成时
+         置 completed），记录批次，一次性提交；applied=0 时不改动会话行。
 
-    与单刀事件共用同一写事务机制：批次与单刀、批次与批次并发时在库级
-    串行，后到者基于最新状态重新对账——已被覆盖的批次自然转为“全部
-    跳过”或 409，不会重复推进。
+    版本流中换刀确认也占一个版本号，故对账区间刀数由 base_version 之前的
+    切刀版本节点数（事件 + 批次应用的刀，不含换刀）确定。与单刀事件/换刀
+    确认共用同一写事务机制：批次与单刀、批次与换刀、批次与批次并发时在库级
+    串行，后到者基于最新状态重新对账——已被覆盖的批次自然转为“全部跳过”或
+    409，不会重复推进。
     """
     request_json = db.canonical_request(req.model_dump())
     with db.transaction() as conn:
@@ -371,12 +557,14 @@ def submit_cut_batch(session_id: str, req: CutBatchRequest) -> Optional[dict]:
         plan = json.loads(row["plan_json"])
         cuts = flatten_cuts(plan)
         n = len(req.cuts)
-        # version 与 completed_cuts 始终同步推进，故对账区间刀数 = done - base
-        skip = done - req.base_version
+        # 换刀确认也占版本号：base_version 对应的已完成刀数按切刀事件计数
+        base_done = db.count_events_until_version(
+            session_id, req.base_version, conn)
+        skip = done - base_done
 
         # 3) 对账：base_version 之后已完成的区间必须与批次前缀逐项一致
         for i in range(skip):
-            expected = cuts[req.base_version + i]
+            expected = cuts[base_done + i]
             received = req.cuts[i] if i < n else None
             if (received is None
                     or received.panel_no != expected["panel_no"]
@@ -384,7 +572,24 @@ def submit_cut_batch(session_id: str, req: CutBatchRequest) -> Optional[dict]:
                 raise SessionConflictError(_batch_mismatch_detail(
                     "reconcile", i, expected, received, skip, n))
 
-        # 4) 其余后缀必须连续匹配当前方案的下一刀序列
+        # 4) 其余后缀必须连续匹配当前方案的下一刀序列；且不得越过寿命检查点
+        life = row["blade_life"]
+        used = float(row["blade_used"])
+        # base_version 之后服务端若已确认换刀，待应用切刀（设备离线时用旧
+        # 刀片完成）不能记到新刀片上：整批改以换刀后版本为基线重发
+        applied_cut_count = n - skip
+        if (applied_cut_count > 0
+                and db.has_blade_change_after_version(
+                    session_id, req.base_version, conn)):
+            raise SessionConflictError({
+                "error": "blade_changed_since_base",
+                "message": f"base_version={req.base_version} 之后服务端已确认"
+                           "换刀，本批次待应用切刀不能记到新刀片上，整批未推进；"
+                           "请以换刀后的版本为基线重发后续切刀",
+                "base_version": req.base_version,
+                "current_version": version,
+            })
+        applied_length = 0.0
         for k in range(skip, n):
             pos = done + (k - skip)
             expected = cuts[pos] if pos < total else None
@@ -394,6 +599,12 @@ def submit_cut_batch(session_id: str, req: CutBatchRequest) -> Optional[dict]:
                     or received.step != expected["step"]):
                 raise SessionConflictError(_batch_mismatch_detail(
                     "apply", k, expected, received, skip, n))
+            length = float(expected["length"])
+            if life is not None and used + applied_length + length \
+                    > float(life) + BLADE_EPS:
+                raise SessionConflictError(_blade_checkpoint_detail(
+                    k, expected, used + applied_length, length, life))
+            applied_length += length
 
         # 5) 验证通过：一次性推进版本与完成数，记录批次，同事务提交
         applied = n - skip
@@ -401,15 +612,33 @@ def submit_cut_batch(session_id: str, req: CutBatchRequest) -> Optional[dict]:
         if applied > 0:
             new_done = done + applied
             finished = new_done >= total
-            db.update_session_progress(
+            new_used = (_round6(used + applied_length)
+                        if life is not None else None)
+            updated = db.update_session_progress(
                 session_id=session_id,
+                expected_version=version,
                 version=version + applied,
                 completed_cuts=new_done,
                 status="completed" if finished else "active",
                 updated_at=now,
                 completed_at=now if finished else None,
                 conn=conn,
+                blade_used=new_used,
             )
+            if updated == 0:
+                # 并发事件/换刀/批次抢先提交：整批回滚，客户端重读后重试对账
+                raise SessionConflictError({
+                    "error": "version_conflict",
+                    "message": f"base_version={req.base_version} 对应的会话状态 "
+                               "已被并发写者推进，整批未推进，请重读后重试",
+                    "base_version": req.base_version,
+                    "current_version": version,
+                })
+            for j in range(applied):
+                applied_cut = cuts[done + j]
+                db.insert_session_op(
+                    session_id, version + j + 1, "batch", conn,
+                    panel_no=applied_cut["panel_no"], step=applied_cut["step"])
             row = db.get_session(session_id, conn)
         result = {
             "skipped": skip,
